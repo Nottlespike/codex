@@ -62,7 +62,10 @@ async fn test_send_message_success() {
 
     // 2) addConversationListener
     let add_listener_id = mcp
-        .send_add_conversation_listener_request(AddConversationListenerParams { conversation_id })
+        .send_add_conversation_listener_request(AddConversationListenerParams {
+            conversation_id,
+            experimental_raw_events: false,
+        })
         .await
         .expect("send addConversationListener");
     let add_listener_resp: JSONRPCResponse = timeout(
@@ -124,6 +127,136 @@ async fn send_message(message: &str, conversation_id: ConversationId, mcp: &mut 
             .expect("should have conversationId"),
         &serde_json::Value::String(conversation_id.to_string())
     );
+
+    let raw_attempt = tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        mcp.read_stream_until_notification_message("codex/event/raw_item"),
+    )
+    .await;
+    assert!(
+        raw_attempt.is_err(),
+        "unexpected raw item notification when not opted in"
+    );
+}
+
+#[tokio::test]
+async fn test_send_message_raw_notifications_opt_in() {
+    let responses = vec![
+        create_final_assistant_message_sse_response("Done").expect("build mock assistant message"),
+    ];
+    let server = create_mock_chat_completions_server(responses).await;
+
+    let codex_home = TempDir::new().expect("create temp dir");
+    create_config_toml(codex_home.path(), &server.uri()).expect("write config.toml");
+
+    let mut mcp = McpProcess::new(codex_home.path())
+        .await
+        .expect("spawn mcp process");
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize())
+        .await
+        .expect("init timed out")
+        .expect("init failed");
+
+    let new_conv_id = mcp
+        .send_new_conversation_request(NewConversationParams::default())
+        .await
+        .expect("send newConversation");
+    let new_conv_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(new_conv_id)),
+    )
+    .await
+    .expect("newConversation timeout")
+    .expect("newConversation resp");
+    let NewConversationResponse {
+        conversation_id, ..
+    } = to_response::<_>(new_conv_resp).expect("deserialize newConversation response");
+
+    let add_listener_id = mcp
+        .send_add_conversation_listener_request(AddConversationListenerParams {
+            conversation_id,
+            experimental_raw_events: true,
+        })
+        .await
+        .expect("send addConversationListener");
+    let add_listener_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(add_listener_id)),
+    )
+    .await
+    .expect("addConversationListener timeout")
+    .expect("addConversationListener resp");
+    let AddConversationSubscriptionResponse { subscription_id: _ } =
+        to_response::<_>(add_listener_resp).expect("deserialize addConversationListener response");
+
+    let send_id = mcp
+        .send_send_user_message_request(SendUserMessageParams {
+            conversation_id,
+            items: vec![InputItem::Text {
+                text: "Hello".to_string(),
+            }],
+        })
+        .await
+        .expect("send sendUserMessage");
+    let response: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(send_id)),
+    )
+    .await
+    .expect("sendUserMessage response timeout")
+    .expect("sendUserMessage response error");
+    let _ok: SendUserMessageResponse = to_response::<SendUserMessageResponse>(response)
+        .expect("deserialize sendUserMessage response");
+
+    let mut attempts = 0;
+    let mut assistant_text: Option<String> = None;
+    while assistant_text.is_none() && attempts < 12 {
+        attempts += 1;
+        let raw_notification: JSONRPCNotification = timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_notification_message("codex/event/raw_item"),
+        )
+        .await
+        .expect("codex/event/raw_item notification timeout")
+        .expect("codex/event/raw_item notification resp");
+        let serde_json::Value::Object(params) = raw_notification
+            .params
+            .expect("codex/event/raw_item should have params")
+        else {
+            panic!("codex/event/raw_item should have params");
+        };
+        let message = params
+            .get("msg")
+            .and_then(|value| value.as_object())
+            .expect("codex/event/raw_item should include message payload");
+        if let Some(role) = message.get("role").and_then(|value| value.as_str())
+            && role == "assistant"
+        {
+            assistant_text = message
+                .get("content")
+                .and_then(|value| value.as_array())
+                .and_then(|items| {
+                    items.iter().find_map(|entry| {
+                        entry
+                            .get("text")
+                            .and_then(|text| text.as_str())
+                            .map(ToString::to_string)
+                    })
+                });
+        }
+    }
+    assert!(
+        assistant_text.is_some(),
+        "expected assistant raw event within allotted attempts"
+    );
+    eprintln!("assistant_text: {assistant_text:?}");
+    assert_eq!(assistant_text.as_deref(), Some("Done"));
+
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_millis(250),
+        mcp.read_stream_until_notification_message("codex/event/task_complete"),
+    )
+    .await;
 }
 
 #[tokio::test]

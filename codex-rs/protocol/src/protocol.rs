@@ -521,6 +521,9 @@ pub enum EventMsg {
     /// Exited review mode with an optional final result to apply.
     ExitedReviewMode(ExitedReviewModeEvent),
 
+    /// Raw response item emitted without being persisted in the rollout file.
+    RawItem(ResponseItem),
+
     ItemStarted(ItemStartedEvent),
     ItemCompleted(ItemCompletedEvent),
 }

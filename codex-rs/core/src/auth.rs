@@ -35,13 +35,17 @@ pub enum AuthCredentialsStoreMode {
     // TODO: Implement keyring support.
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct AuthStorage {
     codex_home: PathBuf,
     mode: AuthCredentialsStoreMode,
 }
 
 impl AuthStorage {
+    fn new(codex_home: PathBuf, mode: AuthCredentialsStoreMode) -> Self {
+        Self { codex_home, mode }
+    }
+
     fn load(&self) -> std::io::Result<Option<AuthDotJson>> {
         match self.mode {
             AuthCredentialsStoreMode::File => self.load_from_file(),
@@ -130,7 +134,7 @@ pub struct CodexAuth {
 
     pub(crate) api_key: Option<String>,
     pub(crate) auth_dot_json: Arc<Mutex<Option<AuthDotJson>>>,
-    pub(crate) storage: Arc<AuthStorage>,
+    storage: Arc<AuthStorage>,
     pub(crate) client: reqwest::Client,
 }
 
@@ -174,8 +178,8 @@ impl CodexAuth {
         Ok(access)
     }
 
-    /// Loads the available auth information from the auth.json.
-    pub fn from_codex_home(codex_home: &Path) -> std::io::Result<Option<CodexAuth>> {
+    /// Loads the available auth information from auth storage.
+    pub fn from_auth_storage(codex_home: &Path) -> std::io::Result<Option<CodexAuth>> {
         load_auth(codex_home, false)
     }
 
@@ -273,7 +277,10 @@ impl CodexAuth {
         Self {
             api_key: None,
             mode: AuthMode::ChatGPT,
-            auth_file: PathBuf::new(),
+            storage: Arc::new(AuthStorage::new(
+                PathBuf::new(),
+                AuthCredentialsStoreMode::File,
+            )),
             auth_dot_json,
             client: crate::default_client::create_client(),
         }
@@ -283,7 +290,10 @@ impl CodexAuth {
         Self {
             api_key: Some(api_key.to_owned()),
             mode: AuthMode::ApiKey,
-            auth_file: PathBuf::new(),
+            storage: Arc::new(AuthStorage::new(
+                PathBuf::new(),
+                AuthCredentialsStoreMode::File,
+            )),
             auth_dot_json: Arc::new(Mutex::new(None)),
             client,
         }
@@ -556,6 +566,10 @@ mod tests {
     #[tokio::test]
     async fn roundtrip_auth_dot_json() {
         let codex_home = tempdir().unwrap();
+        let storage = AuthStorage::new(
+            codex_home.path().to_path_buf(),
+            AuthCredentialsStoreMode::File,
+        );
         let _ = write_auth_file(
             AuthFileParams {
                 openai_api_key: None,
@@ -566,11 +580,11 @@ mod tests {
         )
         .expect("failed to write auth file");
 
-        let file = get_auth_file(codex_home.path());
-        let auth_dot_json = try_read_auth_json(&file).unwrap();
-        write_auth_json(&file, &auth_dot_json).unwrap();
+        let file = storage.get_auth_file(codex_home.path());
+        let auth_dot_json = storage.try_read_auth_json(&file).unwrap();
+        storage.write_auth_json(&file, &auth_dot_json).unwrap();
 
-        let same_auth_dot_json = try_read_auth_json(&file).unwrap();
+        let same_auth_dot_json = storage.try_read_auth_json(&file).unwrap();
         assert_eq!(auth_dot_json, same_auth_dot_json);
     }
 
@@ -595,7 +609,10 @@ mod tests {
 
         super::login_with_api_key(dir.path(), "sk-new").expect("login_with_api_key should succeed");
 
-        let auth = super::try_read_auth_json(&auth_path).expect("auth.json should parse");
+        let storage = AuthStorage::new(dir.path().to_path_buf(), AuthCredentialsStoreMode::File);
+        let auth = storage
+            .try_read_auth_json(&auth_path)
+            .expect("auth.json should parse");
         assert_eq!(auth.openai_api_key.as_deref(), Some("sk-new"));
         assert!(auth.tokens.is_none(), "tokens should be cleared");
     }
@@ -603,7 +620,7 @@ mod tests {
     #[test]
     fn missing_auth_json_returns_none() {
         let dir = tempdir().unwrap();
-        let auth = CodexAuth::from_codex_home(dir.path()).expect("call should succeed");
+        let auth = CodexAuth::from_auth_storage(dir.path()).expect("call should succeed");
         assert_eq!(auth, None);
     }
 
@@ -625,7 +642,7 @@ mod tests {
             api_key,
             mode,
             auth_dot_json,
-            auth_file: _,
+            storage: _,
             ..
         } = super::load_auth(codex_home.path(), false).unwrap().unwrap();
         assert_eq!(None, api_key);
@@ -683,7 +700,8 @@ mod tests {
             tokens: None,
             last_refresh: None,
         };
-        write_auth_json(&get_auth_file(dir.path()), &auth_dot_json)?;
+        let storage = AuthStorage::new(dir.path().to_path_buf(), AuthCredentialsStoreMode::File);
+        storage.save(&auth_dot_json)?;
         assert!(dir.path().join("auth.json").exists());
         let removed = logout(dir.path())?;
         assert!(removed);
@@ -698,7 +716,8 @@ mod tests {
     }
 
     fn write_auth_file(params: AuthFileParams, codex_home: &Path) -> std::io::Result<String> {
-        let auth_file = get_auth_file(codex_home);
+        let storage = AuthStorage::new(codex_home.to_path_buf(), AuthCredentialsStoreMode::File);
+        let auth_file = storage.get_auth_file(codex_home);
         // Create a minimal valid JWT for the id_token field.
         #[derive(Serialize)]
         struct Header {
